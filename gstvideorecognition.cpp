@@ -33,8 +33,10 @@
 #include <math.h>
 #include <opencv2/opencv.hpp>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <map>
+#include <unordered_map>
 
 /* enable to write transformed cvmat to files */
 /* #define DSEXAMPLE_DEBUG */
@@ -108,6 +110,7 @@ enum
     "/workspace/deepstream-app-custom/src/gst-videorecognition/models/"        \
     "x3d.engine"
 #define DEFAULT_LABELS_FILE "labels.txt"
+#define DEFAULT_RECOGNITION_SCORE_THRESHOLD 0.5f
 
 /* the capabilities of the inputs and outputs.
  *
@@ -120,6 +123,164 @@ static GstStaticPadTemplate gst_videorecognition_sink_template =
 static GstStaticPadTemplate gst_videorecognition_src_template =
     GST_STATIC_PAD_TEMPLATE("src", GST_PAD_SRC, GST_PAD_ALWAYS,
                             GST_STATIC_CAPS("ANY"));
+
+namespace
+{
+struct TrackKey
+{
+    guint   source_id;
+    guint64 object_id;
+
+    bool operator==(const TrackKey &other) const
+    {
+        return source_id == other.source_id && object_id == other.object_id;
+    }
+};
+
+struct TrackKeyHash
+{
+    std::size_t operator()(const TrackKey &key) const
+    {
+        std::size_t h1 = std::hash<guint>{}(key.source_id);
+        std::size_t h2 = std::hash<guint64>{}(key.object_id);
+        return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+    }
+};
+
+struct TrackContext
+{
+    explicit TrackContext(guint32 max_history_frames)
+        : process(new Process(max_history_frames))
+    {
+        latest_result.class_id = -1;
+        latest_result.score = 0.0f;
+    }
+
+    std::unique_ptr<Process> process;
+    RECOGNITION              latest_result;
+    guint64                  last_seen_frame_num = 0;
+    guint64                  last_infer_frame_num = 0;
+    bool                     has_result = false;
+};
+
+using TrackContextMap = std::unordered_map<TrackKey, TrackContext, TrackKeyHash>;
+
+static TrackContextMap *
+get_track_contexts(Gstvideorecognition *self)
+{
+    if (!self->track_contexts)
+    {
+        self->track_contexts = new TrackContextMap();
+    }
+    return static_cast<TrackContextMap *>(self->track_contexts);
+}
+
+static void
+clear_track_contexts(Gstvideorecognition *self)
+{
+    TrackContextMap *contexts = get_track_contexts(self);
+    contexts->clear();
+}
+
+static void
+destroy_track_contexts(Gstvideorecognition *self)
+{
+    if (!self->track_contexts)
+    {
+        return;
+    }
+    delete static_cast<TrackContextMap *>(self->track_contexts);
+    self->track_contexts = nullptr;
+}
+
+static TrackContext &
+get_or_create_track_context(Gstvideorecognition *self, guint source_id,
+                            guint64 object_id)
+{
+    TrackContextMap *contexts = get_track_contexts(self);
+    TrackKey         key{source_id, object_id};
+    auto             it = contexts->find(key);
+    if (it == contexts->end())
+    {
+        it = contexts->emplace(key, TrackContext(self->max_history_frames)).first;
+    }
+    return it->second;
+}
+
+static void
+purge_expired_track_contexts(Gstvideorecognition *self)
+{
+    TrackContextMap *contexts = get_track_contexts(self);
+    for (auto it = contexts->begin(); it != contexts->end();)
+    {
+        guint64 frame_gap = self->frame_num - it->second.last_seen_frame_num;
+        if (frame_gap > self->max_history_frames)
+        {
+            it = contexts->erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+}
+
+static void
+remove_existing_classifier_meta(NvDsObjectMeta *obj_meta, guint unique_id)
+{
+    for (NvDsMetaList *l_classifier = obj_meta->classifier_meta_list;
+         l_classifier != nullptr;)
+    {
+        NvDsMetaList      *l_next = l_classifier->next;
+        NvDsClassifierMeta *classifier_meta =
+            (NvDsClassifierMeta *)l_classifier->data;
+        if (classifier_meta && classifier_meta->unique_component_id == unique_id)
+        {
+            nvds_remove_classifier_meta_from_obj(obj_meta, classifier_meta);
+        }
+        l_classifier = l_next;
+    }
+}
+
+static void
+attach_track_result_meta(Gstvideorecognition *self, NvDsBatchMeta *batch_meta,
+                         NvDsObjectMeta *obj_meta, const RECOGNITION &result)
+{
+    if (result.score < DEFAULT_RECOGNITION_SCORE_THRESHOLD)
+    {
+        return;
+    }
+
+    remove_existing_classifier_meta(obj_meta, self->unique_id);
+
+    NvDsClassifierMeta *classifier_meta =
+        nvds_acquire_classifier_meta_from_pool(batch_meta);
+    NvDsLabelInfo *label_info =
+        nvds_acquire_label_info_meta_from_pool(batch_meta);
+    classifier_meta->unique_component_id = self->unique_id;
+    label_info->result_class_id = result.class_id;
+    label_info->result_prob = result.score;
+
+    const char *label_name = result.class_name.empty() ? "unknown"
+                                                       : result.class_name.c_str();
+    if (self->labels_map)
+    {
+        std::map<int, std::string> *labels =
+            (std::map<int, std::string> *)self->labels_map;
+        auto label_it = labels->find(result.class_id);
+        if (label_it != labels->end())
+        {
+            label_name = label_it->second.c_str();
+        }
+    }
+
+    strncpy(label_info->result_label, label_name, MAX_LABEL_SIZE - 1);
+    label_info->result_label[MAX_LABEL_SIZE - 1] = '\0';
+
+    nvds_add_label_info_meta_to_classifier(classifier_meta, label_info);
+    nvds_add_classifier_meta_to_object(obj_meta, classifier_meta);
+}
+} // namespace
 
 static void gst_videorecognition_set_property(GObject      *object,
                                               guint         property_id,
@@ -579,15 +740,11 @@ static void gst_videorecognition_init(Gstvideorecognition *self)
     // X3D需要：num_frames * sampling_rate 的总帧数
     self->max_history_frames =
         self->model_clip_length * self->model_sampling_rate + 10;
-    self->trtProcessPtr = new Process(self->max_history_frames);
+    self->track_contexts = new TrackContextMap();
     const char *trt_engine_file = DEFAULT_TRT_ENGINE_NAME;
     strncpy(self->trt_engine_name, trt_engine_file,
             sizeof(self->trt_engine_name) - 1);
     self->trt_engine_name[sizeof(self->trt_engine_name) - 1] = '\0';
-    self->recognitionResultPtr = new RECOGNITION();
-    self->recognitionResultPtr->class_id = -1;
-    self->recognitionResultPtr->class_name.clear();
-    self->recognitionResultPtr->score = 0.f;
     self->video_recognition = nullptr;
     
     // 初始化标签文件路径
@@ -663,8 +820,17 @@ static GstFlowReturn gst_videorecognition_transform_ip(GstBaseTransform *btrans,
              l_obj = l_obj->next)
         {
             obj_meta = (NvDsObjectMeta *)(l_obj->data);
+
+            if (obj_meta->object_id == UNTRACKED_OBJECT_ID)
+            {
+                continue;
+            }
+
+            TrackContext &track_ctx =
+                get_or_create_track_context(self, frame_meta->source_id,
+                                            obj_meta->object_id);
+            track_ctx.last_seen_frame_num = self->frame_num;
             
-            // 获取单目标跟踪框
             NvOSD_RectParams track_rect_params = obj_meta->rect_params;
             
             cv::Mat track_frame_mat;
@@ -676,18 +842,22 @@ static GstFlowReturn gst_videorecognition_transform_ip(GstBaseTransform *btrans,
                     track_frame_mat) == GST_FLOW_OK &&
                 !track_frame_mat.empty())
             {
-                // 推入帧缓冲
-                if (self->trtProcessPtr)
+                if (track_ctx.process)
                 {
-                    self->trtProcessPtr->addFrame(track_frame_mat);
-                    // 满足长度后做一次推理
-                    if (self->trtProcessPtr->getCurrentFrameLength() ==
-                            (int)self->max_history_frames &&
+                    track_ctx.process->addFrame(track_frame_mat);
+                    gboolean ready_for_infer =
+                        track_ctx.process->getCurrentFrameLength() >=
+                        (int)self->max_history_frames;
+                    gboolean should_refresh =
+                        (track_ctx.last_infer_frame_num == 0) ||
+                        (self->frame_num - track_ctx.last_infer_frame_num >=
+                         (guint64)self->model_sampling_rate);
+
+                    if (ready_for_infer && should_refresh &&
                         self->video_recognition)
                     {
                         std::vector<float> input_data;
-                        // X3D预处理：采样帧，归一化
-                        self->trtProcessPtr->convertCvInputToX3dTensorRT(
+                        track_ctx.process->convertCvInputToX3dTensorRT(
                             input_data, self->model_clip_length,
                             self->processing_height, self->processing_width,
                             self->model_sampling_rate);
@@ -715,53 +885,31 @@ static GstFlowReturn gst_videorecognition_transform_ip(GstBaseTransform *btrans,
                                     x3dPtr->get_output(output_data);
                                     RECOGNITION result =
                                         x3dPtr->parse_output(output_data);
-                                    self->recognitionResultPtr->class_id =
-                                        result.class_id;
-                                    self->recognitionResultPtr->class_name =
-                                        result.class_name;
-                                    self->recognitionResultPtr->score =
-                                        result.score;
+                                    track_ctx.last_infer_frame_num =
+                                        self->frame_num;
+                                    if (result.score >=
+                                        DEFAULT_RECOGNITION_SCORE_THRESHOLD)
+                                    {
+                                        track_ctx.latest_result = result;
+                                        track_ctx.has_result = true;
+                                    }
                                     delete[] output_data;
                                 }
                             }
                         }
-                        self->trtProcessPtr->clearFrames();
                     }
                 }
             }
 
-            // 将视频识别结果写入对象元数据
-            if (self->recognitionResultPtr->score >= 0.5)
+            if (track_ctx.has_result)
             {
-                NvDsClassifierMeta *classifier_meta =
-                    nvds_acquire_classifier_meta_from_pool(batch_meta);
-                classifier_meta->unique_component_id = 9; // X3D component id
-                NvDsLabelInfo *label_info =
-                    nvds_acquire_label_info_meta_from_pool(batch_meta);
-                label_info->result_class_id =
-                    self->recognitionResultPtr->class_id;
-                label_info->result_prob = self->recognitionResultPtr->score;
-                
-                // 从标签映射中查找类别名
-                const char *label_name = "unknown";
-                if (self->labels_map)
-                {
-                    std::map<int, std::string> *labels = (std::map<int, std::string>*)self->labels_map;
-                    if (labels->find(label_info->result_class_id) != labels->end())
-                    {
-                        label_name = (*labels)[label_info->result_class_id].c_str();
-                    }
-                }
-                
-                strncpy(label_info->result_label, label_name, MAX_LABEL_SIZE - 1);
-                label_info->result_label[MAX_LABEL_SIZE - 1] = '\0';
-                
-                nvds_add_label_info_meta_to_classifier(classifier_meta,
-                                                       label_info);
-                nvds_add_classifier_meta_to_object(obj_meta, classifier_meta);
+                attach_track_result_meta(self, batch_meta, obj_meta,
+                                         track_ctx.latest_result);
             }
         }
     }
+
+    purge_expired_track_contexts(self);
 
     flow_ret = GST_FLOW_OK;
 error:
@@ -781,6 +929,14 @@ static gboolean gst_videorecognition_start(GstBaseTransform *btrans)
     NvBufSurfaceCreateParams create_params = {0};
 
     CHECK_CUDA_STATUS(cudaSetDevice(self->gpu_id), "Unable to set cuda device");
+    self->frame_num = 0;
+    clear_track_contexts(self);
+
+    if (!self->video_recognition)
+    {
+        self->video_recognition =
+            new X3dTrt(self->trt_engine_name, self->processing_width);
+    }
     
     // 加载类别标签文件
     if (strlen(self->labels_file) > 0)
@@ -830,6 +986,11 @@ static gboolean gst_videorecognition_start(GstBaseTransform *btrans)
 #else
         NVBUF_MEM_CUDA_PINNED;
 #endif
+    if (self->inter_buf)
+    {
+        NvBufSurfaceDestroy(self->inter_buf);
+        self->inter_buf = NULL;
+    }
     if (NvBufSurfaceCreate(&self->inter_buf, 1, &create_params) != 0)
     {
         GST_ERROR("Error: Could not allocate internal buffer for dsexample");
@@ -851,6 +1012,8 @@ static gboolean gst_videorecognition_stop(GstBaseTransform *btrans)
 {
     Gstvideorecognition *self = GST_VIDEORECOGNITION(btrans);
     g_print("gst_videorecognition_stop\n");
+    clear_track_contexts(self);
+    self->frame_num = 0;
     return TRUE;
 }
 
@@ -894,6 +1057,7 @@ void gst_videorecognition_set_property(GObject *object, guint property_id,
                               (NULL));
             return;
         }
+        clear_track_contexts(self);
         break;
     case PROP_PROCESSING_HEIGHT:
         self->processing_height = g_value_get_int(value);
@@ -904,6 +1068,7 @@ void gst_videorecognition_set_property(GObject *object, guint property_id,
                               (NULL));
             return;
         }
+        clear_track_contexts(self);
         break;
     case PROP_MODEL_CLIP_LENGTH:
         self->model_clip_length = g_value_get_int(value);
@@ -919,11 +1084,7 @@ void gst_videorecognition_set_property(GObject *object, guint property_id,
         // 更新最大历史帧数
         self->max_history_frames =
             self->model_clip_length * self->model_sampling_rate + 10;
-        if (self->trtProcessPtr)
-        {
-            delete self->trtProcessPtr;
-            self->trtProcessPtr = new Process(self->max_history_frames);
-        }
+        clear_track_contexts(self);
         break;
     case PROP_SAMPLING_RATE:
         self->model_sampling_rate = g_value_get_int(value);
@@ -936,11 +1097,7 @@ void gst_videorecognition_set_property(GObject *object, guint property_id,
         // 更新最大历史帧数
         self->max_history_frames =
             self->model_clip_length * self->model_sampling_rate + 10;
-        if (self->trtProcessPtr)
-        {
-            delete self->trtProcessPtr;
-            self->trtProcessPtr = new Process(self->max_history_frames);
-        }
+        clear_track_contexts(self);
         break;
     case PROP_TRT_ENGINE_NAME:
     {
@@ -958,6 +1115,7 @@ void gst_videorecognition_set_property(GObject *object, guint property_id,
         // 初始化X3D引擎
         self->video_recognition =
             new X3dTrt(self->trt_engine_name, self->processing_width);
+        clear_track_contexts(self);
         GST_INFO_OBJECT(self, "Initialized X3D recognition engine with %s",
                         self->trt_engine_name);
         break;
@@ -1025,12 +1183,6 @@ void gst_videorecognition_finalize(GObject *object)
         self->video_recognition = NULL;
     }
 
-    if (self->recognitionResultPtr)
-    {
-        delete self->recognitionResultPtr;
-        self->recognitionResultPtr = NULL;
-    }
-
     if (self->inter_buf)
     {
         NvBufSurfaceDestroy(self->inter_buf);
@@ -1041,17 +1193,13 @@ void gst_videorecognition_finalize(GObject *object)
         cudaStreamDestroy(self->cuda_stream);
         self->cuda_stream = NULL;
     }
-    if (self->trtProcessPtr)
-    {
-        delete self->trtProcessPtr;
-        self->trtProcessPtr = NULL;
-    }
-    
     if (self->labels_map)
     {
         delete (std::map<int, std::string>*)self->labels_map;
         self->labels_map = NULL;
     }
+
+    destroy_track_contexts(self);
 
     G_OBJECT_CLASS(parent_class)->finalize(object);
 }

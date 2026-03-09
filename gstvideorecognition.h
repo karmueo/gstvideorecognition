@@ -60,10 +60,8 @@ struct _Gstvideorecognition
     // 最大保存历史帧数
     guint32 max_history_frames;
 
-    Process *trtProcessPtr;
-
-    // 视频识别结果结构
-    RECOGNITION *recognitionResultPtr;
+    // 按 (source_id, object_id) 维护的轨迹上下文表
+    void *track_contexts;
     
     // 分类器 TensorRT 引擎路径（来自 trt-engine-name 属性）
     char trt_engine_name[512];
