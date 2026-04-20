@@ -97,6 +97,7 @@ enum
     PROP_PROCESSING_HEIGHT,
     PROP_MODEL_CLIP_LENGTH,
     PROP_SAMPLING_RATE,
+    PROP_INFER_INTERVAL,
     PROP_TRT_ENGINE_NAME,
     PROP_LABELS_FILE
 };
@@ -106,6 +107,7 @@ enum
 #define DEFAULT_PROCESSING_HEIGHT 64
 #define DEFAULT_PROCESSING_MODEL_CLIP_LENGTH 32
 #define DEFAULT_SAMPLING_RATE 5
+#define DEFAULT_INFER_INTERVAL 0
 #define DEFAULT_TRT_ENGINE_NAME                                                \
     "/workspace/deepstream-app-custom/src/gst-videorecognition/models/"        \
     "x3d.engine"
@@ -674,6 +676,15 @@ static void gst_videorecognition_class_init(GstvideorecognitionClass *klass)
             (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
     g_object_class_install_property(
+        gobject_class, PROP_INFER_INTERVAL,
+        g_param_spec_int(
+            "infer-interval", "Infer Interval",
+            "Number of frames between consecutive inference calls per track "
+            "(0 = use sampling-rate)",
+            0, G_MAXINT, DEFAULT_INFER_INTERVAL,
+            (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+
+    g_object_class_install_property(
         gobject_class, PROP_TRT_ENGINE_NAME,
         g_param_spec_string(
             "trt-engine-name", "TensorRT Engine Name",
@@ -737,6 +748,7 @@ static void gst_videorecognition_init(Gstvideorecognition *self)
     self->processing_frame_interval = 1;
     self->model_clip_length = DEFAULT_PROCESSING_MODEL_CLIP_LENGTH;
     self->model_sampling_rate = DEFAULT_SAMPLING_RATE;
+    self->infer_interval = DEFAULT_INFER_INTERVAL;
     // X3D需要：num_frames * sampling_rate 的总帧数
     self->max_history_frames =
         self->model_clip_length * self->model_sampling_rate + 10;
@@ -851,7 +863,9 @@ static GstFlowReturn gst_videorecognition_transform_ip(GstBaseTransform *btrans,
                     gboolean should_refresh =
                         (track_ctx.last_infer_frame_num == 0) ||
                         (self->frame_num - track_ctx.last_infer_frame_num >=
-                         (guint64)self->model_sampling_rate);
+                         (guint64)(self->infer_interval > 0
+                                       ? self->infer_interval
+                                       : self->model_sampling_rate));
 
                     if (ready_for_infer && should_refresh &&
                         self->video_recognition)
@@ -1099,6 +1113,9 @@ void gst_videorecognition_set_property(GObject *object, guint property_id,
             self->model_clip_length * self->model_sampling_rate + 10;
         clear_track_contexts(self);
         break;
+    case PROP_INFER_INTERVAL:
+        self->infer_interval = g_value_get_int(value);
+        break;
     case PROP_TRT_ENGINE_NAME:
     {
         const gchar *s = g_value_get_string(value);
@@ -1160,6 +1177,9 @@ void gst_videorecognition_get_property(GObject *object, guint property_id,
         break;
     case PROP_SAMPLING_RATE:
         g_value_set_int(value, self->model_sampling_rate);
+        break;
+    case PROP_INFER_INTERVAL:
+        g_value_set_int(value, self->infer_interval);
         break;
     case PROP_LABELS_FILE:
         g_value_set_string(value, self->labels_file);
