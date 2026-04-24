@@ -54,6 +54,7 @@ struct _Gstvideorecognition
     gint processing_frame_interval;
     gint model_sampling_rate; // X3D 采样率
     gint infer_interval;      // 推理刷新间隔（帧数），0 表示使用 sampling-rate
+    gint class_lock_after_sec; // 目标跟踪指定秒数后锁定类别，0 表示关闭
 
     // 用于RGBA转换的中间临时缓冲区
     NvBufSurface *inter_buf;

@@ -98,6 +98,7 @@ enum
     PROP_MODEL_CLIP_LENGTH,
     PROP_SAMPLING_RATE,
     PROP_INFER_INTERVAL,
+    PROP_CLASS_LOCK_AFTER_SEC,
     PROP_TRT_ENGINE_NAME,
     PROP_LABELS_FILE
 };
@@ -108,6 +109,7 @@ enum
 #define DEFAULT_PROCESSING_MODEL_CLIP_LENGTH 32
 #define DEFAULT_SAMPLING_RATE 5
 #define DEFAULT_INFER_INTERVAL 0
+#define DEFAULT_CLASS_LOCK_AFTER_SEC 0
 #define DEFAULT_TRT_ENGINE_NAME                                                \
     "/workspace/deepstream-app-custom/src/gst-videorecognition/models/"        \
     "x3d.engine"
@@ -162,7 +164,10 @@ struct TrackContext
     RECOGNITION              latest_result;
     guint64                  last_seen_frame_num = 0;
     guint64                  last_infer_frame_num = 0;
+    guint64                  first_seen_time_ns = 0;
+    bool                     first_seen_time_valid = false;
     bool                     has_result = false;
+    bool                     class_locked = false;
 };
 
 using TrackContextMap = std::unordered_map<TrackKey, TrackContext, TrackKeyHash>;
@@ -225,6 +230,51 @@ purge_expired_track_contexts(Gstvideorecognition *self)
             ++it;
         }
     }
+}
+
+static guint64
+get_current_frame_time_ns(Gstvideorecognition *self, GstBuffer *inbuf,
+                          NvDsFrameMeta *frame_meta)
+{
+    if (frame_meta && GST_CLOCK_TIME_IS_VALID(frame_meta->buf_pts) &&
+        frame_meta->buf_pts > 0)
+    {
+        return frame_meta->buf_pts;
+    }
+
+    if (GST_CLOCK_TIME_IS_VALID(GST_BUFFER_PTS(inbuf)) &&
+        GST_BUFFER_PTS(inbuf) > 0)
+    {
+        return GST_BUFFER_PTS(inbuf);
+    }
+
+    if (GST_VIDEO_INFO_FPS_N(&self->video_info) > 0 &&
+        GST_VIDEO_INFO_FPS_D(&self->video_info) > 0)
+    {
+        guint64 frame_index = self->frame_num > 0 ? self->frame_num - 1 : 0;
+        return gst_util_uint64_scale(frame_index * GST_SECOND,
+                                     GST_VIDEO_INFO_FPS_D(&self->video_info),
+                                     GST_VIDEO_INFO_FPS_N(&self->video_info));
+    }
+
+    return self->frame_num * GST_SECOND;
+}
+
+static bool
+is_class_lock_due(Gstvideorecognition *self, const TrackContext &track_ctx,
+                  guint64 current_time_ns)
+{
+    if (self->class_lock_after_sec <= 0 ||
+        !track_ctx.first_seen_time_valid ||
+        current_time_ns < track_ctx.first_seen_time_ns)
+    {
+        return false;
+    }
+
+    guint64 elapsed_ns = current_time_ns - track_ctx.first_seen_time_ns;
+    guint64 lock_after_ns =
+        (guint64)self->class_lock_after_sec * GST_SECOND;
+    return elapsed_ns >= lock_after_ns;
 }
 
 static void
@@ -685,6 +735,15 @@ static void gst_videorecognition_class_init(GstvideorecognitionClass *klass)
             (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
     g_object_class_install_property(
+        gobject_class, PROP_CLASS_LOCK_AFTER_SEC,
+        g_param_spec_int(
+            "class-lock-after-sec", "Class Lock After Seconds",
+            "Lock class result after a tracked object has been visible for "
+            "the configured seconds (0 = disabled)",
+            0, G_MAXINT, DEFAULT_CLASS_LOCK_AFTER_SEC,
+            (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+
+    g_object_class_install_property(
         gobject_class, PROP_TRT_ENGINE_NAME,
         g_param_spec_string(
             "trt-engine-name", "TensorRT Engine Name",
@@ -749,6 +808,7 @@ static void gst_videorecognition_init(Gstvideorecognition *self)
     self->model_clip_length = DEFAULT_PROCESSING_MODEL_CLIP_LENGTH;
     self->model_sampling_rate = DEFAULT_SAMPLING_RATE;
     self->infer_interval = DEFAULT_INFER_INTERVAL;
+    self->class_lock_after_sec = DEFAULT_CLASS_LOCK_AFTER_SEC;
     // X3D需要：num_frames * sampling_rate 的总帧数
     self->max_history_frames =
         self->model_clip_length * self->model_sampling_rate + 10;
@@ -787,6 +847,7 @@ static GstFlowReturn gst_videorecognition_transform_ip(GstBaseTransform *btrans,
     NvDsBatchMeta *batch_meta = NULL;
     NvDsFrameMeta *frame_meta = NULL;
     NvDsMetaList  *l_frame = NULL;
+    guint64        current_time_ns = 0;
 
     self->frame_num++;
 
@@ -823,6 +884,7 @@ static GstFlowReturn gst_videorecognition_transform_ip(GstBaseTransform *btrans,
         NvDsMetaList   *l_obj = NULL;
         NvDsObjectMeta *obj_meta = NULL;
         frame_meta = (NvDsFrameMeta *)(l_frame->data);
+        current_time_ns = get_current_frame_time_ns(self, inbuf, frame_meta);
         
         /* 仅在确实需要 CPU 访问时才映射。当前路径不使用 CPU 直接访问，
          * dGPU 上 NVBUF_MEM_CUDA_DEVICE 映射会失败。 */
@@ -841,7 +903,18 @@ static GstFlowReturn gst_videorecognition_transform_ip(GstBaseTransform *btrans,
             TrackContext &track_ctx =
                 get_or_create_track_context(self, frame_meta->source_id,
                                             obj_meta->object_id);
+            if (!track_ctx.first_seen_time_valid)
+            {
+                track_ctx.first_seen_time_ns = current_time_ns;
+                track_ctx.first_seen_time_valid = true;
+            }
             track_ctx.last_seen_frame_num = self->frame_num;
+            bool class_lock_due =
+                is_class_lock_due(self, track_ctx, current_time_ns);
+            if (class_lock_due && track_ctx.has_result)
+            {
+                track_ctx.class_locked = true;
+            }
             
             NvOSD_RectParams track_rect_params = obj_meta->rect_params;
             
@@ -868,6 +941,7 @@ static GstFlowReturn gst_videorecognition_transform_ip(GstBaseTransform *btrans,
                                        : self->model_sampling_rate));
 
                     if (ready_for_infer && should_refresh &&
+                        !track_ctx.class_locked &&
                         self->video_recognition)
                     {
                         std::vector<float> input_data;
@@ -906,6 +980,10 @@ static GstFlowReturn gst_videorecognition_transform_ip(GstBaseTransform *btrans,
                                     {
                                         track_ctx.latest_result = result;
                                         track_ctx.has_result = true;
+                                        if (class_lock_due)
+                                        {
+                                            track_ctx.class_locked = true;
+                                        }
                                     }
                                     delete[] output_data;
                                 }
@@ -1116,6 +1194,19 @@ void gst_videorecognition_set_property(GObject *object, guint property_id,
     case PROP_INFER_INTERVAL:
         self->infer_interval = g_value_get_int(value);
         break;
+    case PROP_CLASS_LOCK_AFTER_SEC:
+        self->class_lock_after_sec = g_value_get_int(value);
+        if (self->class_lock_after_sec < 0)
+        {
+            self->class_lock_after_sec = DEFAULT_CLASS_LOCK_AFTER_SEC;
+            GST_ELEMENT_ERROR(self, STREAM, FAILED,
+                              ("class-lock-after-sec must be greater than or "
+                               "equal to 0"),
+                              (NULL));
+            return;
+        }
+        clear_track_contexts(self);
+        break;
     case PROP_TRT_ENGINE_NAME:
     {
         const gchar *s = g_value_get_string(value);
@@ -1180,6 +1271,9 @@ void gst_videorecognition_get_property(GObject *object, guint property_id,
         break;
     case PROP_INFER_INTERVAL:
         g_value_set_int(value, self->infer_interval);
+        break;
+    case PROP_CLASS_LOCK_AFTER_SEC:
+        g_value_set_int(value, self->class_lock_after_sec);
         break;
     case PROP_LABELS_FILE:
         g_value_set_string(value, self->labels_file);
